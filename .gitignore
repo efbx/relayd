@@ -1,0 +1,6 @@
+/target
+/data
+/relayd-app/bin
+.DS_Store
+data/
+.idea/

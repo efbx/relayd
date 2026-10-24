@@ -1,0 +1,10 @@
+[application]
+name = "relayd"
+
+[web.app]
+title = "RelayD"
+
+[bundle]
+identifier = "rs.relayd.app"
+publisher = "RelayD"
+external_bin = ["relayd-app/bin/cloudflared", "relayd-app/bin/wireproxy"]

@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["relayd-app", "relayd-core", "relayd-monitor", "relayd-proxy", "relayd-settings", "relayd-storage", "relayd-targets", "relayd-tunnel", "relayd-ui", "relayd-vpn"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+redundant_clone = "warn"
+needless_collect = "warn"
+or_fun_call = "warn"
+format_push_string = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+format_collect = "warn"
+assigning_clones = "warn"
+needless_pass_by_value = "warn"
+unnecessary_to_owned = "warn"
+redundant_allocation = "warn"

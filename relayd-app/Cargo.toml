@@ -1,0 +1,59 @@
+[package]
+name = "relayd-app"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.95"
+
+[[bin]]
+name = "relayd"
+path = "src/main.rs"
+
+[dependencies]
+dioxus = { version = "0.7.10", default-features = false, features = ["launch"] }
+relayd-ui = { path = "../relayd-ui", optional = true }
+anyhow = { version = "1.0.104", optional = true }
+dirs = { version = "7.0.0", optional = true }
+sylk = { version = "0.5.0", optional = true }
+relayd-core = { path = "../relayd-core", optional = true }
+relayd-monitor = { path = "../relayd-monitor", optional = true }
+relayd-proxy = { path = "../relayd-proxy", optional = true }
+relayd-settings = { path = "../relayd-settings", optional = true }
+relayd-targets = { path = "../relayd-targets", optional = true }
+relayd-tunnel = { path = "../relayd-tunnel", optional = true }
+relayd-vpn = { path = "../relayd-vpn", optional = true }
+rustls-graviola = { version = "0.4.0", optional = true }
+
+[features]
+web = ["dioxus/web", "dioxus/devtools", "dep:relayd-ui", "relayd-ui/web"]
+server = [
+    "dep:anyhow",
+    "sylk/server",
+    "relayd-core/backend",
+    "relayd-monitor/server",
+    "dep:relayd-proxy",
+    "relayd-settings/server",
+    "relayd-targets/server",
+    "relayd-tunnel/server",
+    "relayd-vpn/server",
+    "dep:rustls-graviola",
+]
+standalone = [
+    "dioxus/desktop",
+    "dioxus/logger",
+    "dep:anyhow",
+    "dep:dirs",
+    "sylk/standalone",
+    "relayd-core/backend",
+    "relayd-monitor/standalone",
+    "dep:relayd-proxy",
+    "relayd-settings/standalone",
+    "relayd-targets/standalone",
+    "relayd-tunnel/standalone",
+    "dep:relayd-ui",
+    "relayd-ui/standalone",
+    "relayd-vpn/standalone",
+    "dep:rustls-graviola",
+]
+
+[lints]
+workspace = true

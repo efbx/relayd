@@ -1,0 +1,16 @@
+[package]
+name = "relayd-core"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+http = "1.5.0"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+axum = { version = "0.8.9", optional = true }
+
+[features]
+backend = ["dep:axum"]
+
+[lints]
+workspace = true

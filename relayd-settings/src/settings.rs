@@ -1,0 +1,61 @@
+use std::net::{Ipv4Addr, SocketAddr};
+
+use relayd_tunnel::TunnelMode;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Settings {
+    pub listen: SocketAddr,
+    pub tunnel: TunnelMode,
+    pub idle_timeout: u64,
+    pub captures: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 8585)),
+            tunnel: TunnelMode::default(),
+            idle_timeout: 0,
+            captures: 10,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use relayd_tunnel::TunnelMode;
+
+    use super::*;
+
+    #[test]
+    fn defaults_are_a_local_proxy_and_a_quick_tunnel() {
+        let settings = Settings::default();
+        assert_eq!(settings.listen.to_string(), "127.0.0.1:8585");
+        assert_eq!(settings.tunnel, TunnelMode::Quick);
+        assert_eq!((settings.idle_timeout, settings.captures), (0, 10));
+    }
+
+    #[test]
+    fn an_old_file_with_an_admin_address_and_no_tunnel_still_loads() {
+        let settings: Settings =
+            ron::from_str("(listen: \"127.0.0.1:9000\", admin: \"0.0.0.0:8080\")").unwrap();
+        assert_eq!(settings.listen.port(), 9000);
+        assert_eq!(settings.tunnel, TunnelMode::Quick);
+        assert_eq!((settings.idle_timeout, settings.captures), (0, 10));
+    }
+
+    #[test]
+    fn every_tunnel_mode_reads_from_ron() {
+        let off: Settings = ron::from_str("(tunnel: Off)").unwrap();
+        let domain: Settings = ron::from_str("(tunnel: Domain(token: \"abc\"))").unwrap();
+        assert_eq!(off.tunnel, TunnelMode::Off);
+        assert_eq!(
+            domain.tunnel,
+            TunnelMode::Domain {
+                token: "abc".into()
+            }
+        );
+    }
+}

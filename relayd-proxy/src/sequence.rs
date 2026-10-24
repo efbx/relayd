@@ -1,0 +1,51 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
+use relayd_core::Error;
+use relayd_monitor::Entry;
+use relayd_storage::RdbStore;
+
+#[derive(Clone, Debug)]
+pub struct Sequence {
+    next: Arc<AtomicU64>,
+}
+
+#[sylk::resource]
+fn sequence(history: RdbStore<Entry>) -> Result<Sequence, Error> {
+    Ok(Sequence::after(history.newest_key()?))
+}
+
+impl Sequence {
+    #[must_use]
+    pub fn after(last: Option<u64>) -> Self {
+        Self {
+            next: Arc::new(AtomicU64::new(last.map_or(1, |last| last + 1))),
+        }
+    }
+
+    #[must_use]
+    pub fn next(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continues_after_the_last_key_or_starts_at_one() {
+        let sequence = Sequence::after(Some(41));
+        assert_eq!((sequence.next(), sequence.next()), (42, 43));
+        assert_eq!(Sequence::after(None).next(), 1);
+    }
+
+    #[test]
+    fn clones_share_the_counter() {
+        let sequence = Sequence::after(None);
+        let other = sequence.clone();
+        assert_eq!((sequence.next(), other.next(), sequence.next()), (1, 2, 3));
+    }
+}

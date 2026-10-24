@@ -1,0 +1,27 @@
+[package]
+name = "relayd-settings"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+relayd-tunnel = { path = "../relayd-tunnel" }
+dioxus-fullstack = { version = "0.7.10", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+dioxus-server = { version = "0.7.10", optional = true }
+relayd-core = { path = "../relayd-core", optional = true }
+relayd-monitor = { path = "../relayd-monitor", optional = true }
+relayd-proxy = { path = "../relayd-proxy", optional = true }
+relayd-storage = { path = "../relayd-storage", optional = true }
+ron = { version = "0.12.2", optional = true }
+sylk = "0.5.0"
+tokio = { version = "1.54.1", features = ["rt", "time"], optional = true }
+
+[features]
+backend = ["relayd-tunnel/backend", "dep:ron", "dep:relayd-core", "relayd-core/backend", "dep:relayd-monitor", "relayd-monitor/backend", "dep:relayd-proxy", "dep:relayd-storage", "relayd-storage/backend", "dep:tokio"]
+server = ["backend", "relayd-tunnel/server", "dioxus-fullstack/server", "dep:dioxus-server", "sylk/server"]
+web = ["dioxus-fullstack/web", "relayd-tunnel/web"]
+standalone = ["backend", "relayd-tunnel/standalone", "sylk/standalone"]
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "relayd-targets"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+relayd-core = { path = "../relayd-core" }
+dioxus-fullstack = { version = "0.7.10", default-features = false }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+axum = { version = "0.8.9", optional = true }
+dioxus-server = { version = "0.7.10", optional = true }
+relayd-storage = { path = "../relayd-storage", optional = true }
+sylk = "0.5.0"
+
+[features]
+backend = ["relayd-core/backend", "dep:axum", "dep:relayd-storage", "relayd-storage/backend"]
+server = ["backend", "dioxus-fullstack/server", "dep:dioxus-server", "sylk/server"]
+web = ["dioxus-fullstack/web"]
+standalone = ["backend", "sylk/standalone"]
+
+[lints]
+workspace = true
