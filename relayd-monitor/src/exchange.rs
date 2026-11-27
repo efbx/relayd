@@ -25,10 +25,6 @@ pub enum Content {
     Binary,
 }
 
-impl Exchange {
-    pub const BODY_CAP: usize = 1 << 20;
-}
-
 #[cfg(feature = "backend")]
 impl Content {
     pub(crate) fn from_bytes(bytes: Vec<u8>, truncated: bool) -> Self {

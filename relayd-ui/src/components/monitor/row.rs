@@ -10,7 +10,6 @@ pub(super) fn MonitorRow(
     index: usize,
     id: u64,
     mut open: Signal<Option<u64>>,
-    version: Signal<u64>,
 ) -> Element {
     let is_open = use_memo(move || open() == Some(id));
     let Some(entry) = rows.get(index) else {
@@ -45,9 +44,9 @@ pub(super) fn MonitorRow(
         if expanded {
             ExchangePanel {
                 id,
-                version,
+                stage: entry.stage,
                 started: entry.started,
-                finished: entry.finished(),
+                elapsed: entry.elapsed,
                 sent: entry.sent,
                 received: entry.received,
             }

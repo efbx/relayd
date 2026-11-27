@@ -73,8 +73,15 @@ again.
 
 Settings are edited on the admin page and stored in `relayd.ron` in the data folder. Tunnel changes apply on restart.
 
-The monitor keeps the last 10,000 requests. "Stored contents" sets how many of the newest ones also keep their headers and
-bodies, 10 by default and 0 for off, with at most 1 MiB per body; the rest of a longer body streams through unrecorded.
+"History" sets how many of the newest requests the monitor keeps, 10,000 by default. "Stored contents" sets how many of
+those also keep their headers and bodies, 10 by default. Each has a "prune every" number, 256 and 5 by default: the oldest
+are dropped in one go once the list is that many over its size. A size of 0 stops recording without deleting anything,
+and with history at 0 no contents are stored either. New limits apply when the next request finishes; "clear contents" on
+the monitor page deletes the stored contents.
+
+"Body limit" sets how much of each request and response body is stored: a number, decimals allowed, in KiB, MiB or GiB,
+1 MiB by default. The rest of a longer body streams through unrecorded, and 0 stores the headers only. It applies to
+requests that start after it is saved.
 Credentials are stored redacted: the `authorization`, `proxy-authorization`, `x-api-key`, `cookie` and `set-cookie`
 headers, and every header a `set` rule injects.
 

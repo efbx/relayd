@@ -39,3 +39,14 @@ pub async fn clear_history() -> Result<(), ServerFnError> {
         details: None,
     })
 }
+
+#[sylk::server(monitor: Monitor)]
+pub async fn clear_contents() -> Result<(), ServerFnError> {
+    monitor
+        .clear_contents()
+        .map_err(|error| ServerFnError::ServerError {
+            message: error.message,
+            code: 500,
+            details: None,
+        })
+}

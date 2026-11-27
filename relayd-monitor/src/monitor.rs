@@ -14,13 +14,13 @@ use relayd_storage::{Page, RdbStore};
 use sylk::Pack;
 use tokio::time::MissedTickBehavior;
 
-use crate::{ByteMeter, Capture, CaptureLimit, Direction, Entry, Event, Exchange};
+use crate::{ByteMeter, Capture, Direction, Entry, Event, Exchange, Limits};
 
 #[derive(Clone, Debug, Pack)]
 pub struct Monitor {
     store: RdbStore<Entry>,
     exchanges: RdbStore<Exchange>,
-    captures: CaptureLimit,
+    limits: Limits,
     #[pack(func = Arc::default())]
     live: Arc<Mutex<BTreeMap<u64, Entry>>>,
     #[pack(func = Arc::default())]
@@ -41,8 +41,6 @@ fn exchanges(history: RdbStore<Entry>) -> RdbStore<Exchange> {
 
 impl Monitor {
     const PAGE: usize = 20;
-    const KEEP: u64 = 10_000;
-    const PRUNE_EVERY: u64 = 256;
     const TICK: Duration = Duration::from_millis(500);
 
     pub(crate) fn record(&self, entry: Entry) {
@@ -67,12 +65,15 @@ impl Monitor {
             None
         };
         drop(live);
+        if finished {
+            self.store_capture(id);
+        }
         if let Some(changed) = changed {
-            self.persist(&changed);
             if finished {
+                self.settle(&changed);
                 tracing::info!("{changed}");
-                self.trim(changed.id);
-                self.store_capture(changed.id);
+            } else {
+                self.persist(&changed);
             }
         }
         self.changed();
@@ -83,28 +84,27 @@ impl Monitor {
         let live = self.live();
         for row in &mut page.items {
             if let Some(fresh) = live.get(&row.id) {
-                *row = fresh.clone();
+                *row = fresh.running();
             }
         }
         Ok(page)
     }
 
     pub fn exchange(&self, id: u64) -> Result<Option<Exchange>, Error> {
-        self.exchanges.get(id)
-    }
-
-    pub fn limit_captures(&self, count: u64) {
-        self.captures.set(count);
-        if let Err(error) = self.forget_captures_beyond(count) {
-            tracing::error!("history: {}", error.message);
+        if let Some(capture) = self.pending().get(&id) {
+            return Ok(Some(capture.snapshot(id)));
         }
-        self.changed();
+        self.exchanges.get(id)
     }
 
     pub fn clear(&self) -> Result<(), Error> {
         self.live().clear();
-        self.pending().clear();
         self.store.clear()?;
+        self.clear_contents()
+    }
+
+    pub fn clear_contents(&self) -> Result<(), Error> {
+        self.pending().clear();
         self.exchanges.clear()?;
         self.changed();
         Ok(())
@@ -139,21 +139,19 @@ impl Monitor {
         }
     }
 
-    fn trim(&self, newest: u64) {
-        if !newest.is_multiple_of(Self::PRUNE_EVERY) {
-            return;
-        }
-        match self.store.prune(newest.saturating_sub(Self::KEEP)) {
-            Ok(0) => {}
-            Ok(_) => self.changed(),
-            Err(error) => tracing::error!("history: {}", error.message),
+    fn settle(&self, entry: &Entry) {
+        let Some(retention) = self.limits.history() else {
+            return self.persist(entry);
+        };
+        if let Err(error) = self.store.put_keeping(entry, retention) {
+            tracing::error!("history: {}", error.message);
         }
     }
 
     fn start_capture(&self, id: u64, headers: &HeaderMap, rules: &[Rule]) {
-        let mut pending = self.pending();
-        if self.captures.count() > 0 {
-            pending.insert(id, Capture::new(headers, rules));
+        if self.limits.captures().is_some() {
+            let capture = Capture::new(headers, rules, self.limits.body());
+            self.pending().insert(id, capture);
         }
     }
 
@@ -177,22 +175,13 @@ impl Monitor {
         let Some(capture) = self.pending().remove(&id) else {
             return;
         };
-        let count = self.captures.count();
-        if count == 0 {
+        let Some(retention) = self.limits.captures() else {
             return;
-        }
+        };
         let exchange = capture.into_exchange(id);
-        if let Err(error) = self.exchanges.put_keeping(&exchange, count) {
+        if let Err(error) = self.exchanges.put_keeping(&exchange, retention) {
             tracing::error!("history: {}", error.message);
         }
-    }
-
-    fn forget_captures_beyond(&self, count: u64) -> Result<(), Error> {
-        if count == 0 {
-            self.pending().clear();
-            return self.exchanges.clear();
-        }
-        self.exchanges.keep_newest(count).map(drop)
     }
 
     fn live(&self) -> MutexGuard<'_, BTreeMap<u64, Entry>> {
@@ -211,8 +200,10 @@ impl Monitor {
 #[sylk::register(order = 20)]
 impl Interceptor for Monitor {
     fn on_request(&self, ctx: &Ctx, outgoing: &mut Outgoing) -> Result<(), Box<Reply>> {
-        self.record(Entry::new(ctx));
-        self.start_capture(ctx.id, &outgoing.headers, &ctx.target.rules);
+        if self.limits.history().is_some() {
+            self.record(Entry::new(ctx));
+            self.start_capture(ctx.id, &outgoing.headers, &ctx.target.rules);
+        }
         Ok(())
     }
 
@@ -250,12 +241,21 @@ mod tests {
 
     use axum::{
         body::Bytes,
-        http::{HeaderName, HeaderValue},
+        http::{HeaderName, HeaderValue, Method},
     };
     use futures_util::StreamExt;
+    use relayd_core::Target;
+    use relayd_storage::Retention;
 
     use super::*;
     use crate::{Content, Stage};
+
+    const HISTORY: Retention = Retention {
+        keep: 10_000,
+        every: 256,
+    };
+    const OFF: Retention = Retention { keep: 0, every: 1 };
+    const BODY: usize = 1 << 20;
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
         pairs
@@ -277,7 +277,7 @@ mod tests {
         Monitor {
             exchanges: store.sibling(),
             store,
-            captures: CaptureLimit::new(2),
+            limits: Limits::new(HISTORY, Retention { keep: 2, every: 1 }, BODY),
             live: Arc::default(),
             pending: Arc::default(),
             version: Arc::default(),
@@ -302,6 +302,28 @@ mod tests {
 
     fn ids(page: &Page<Entry>) -> Vec<u64> {
         page.items.iter().map(|entry| entry.id).collect()
+    }
+
+    fn ctx(id: u64) -> Ctx {
+        Ctx {
+            id,
+            method: Method::GET,
+            path: "/x".into(),
+            target: Arc::new(Target {
+                prefix: "/".into(),
+                upstream: "http://upstream".into(),
+                rules: Vec::new(),
+                vpn: None,
+            }),
+        }
+    }
+
+    fn outgoing() -> Outgoing {
+        Outgoing {
+            method: Method::GET,
+            url: "http://upstream/x".to_owned(),
+            headers: HeaderMap::new(),
+        }
     }
 
     #[test]
@@ -333,6 +355,16 @@ mod tests {
     }
 
     #[test]
+    fn pages_show_how_long_running_requests_have_run() {
+        let monitor = monitor("running-time");
+        monitor.record(entry(1));
+        assert!(monitor.page(0).unwrap().items[0].elapsed > 0);
+        assert_eq!(monitor.store.get(1).unwrap().unwrap().elapsed, 0);
+        monitor.update(1, |entry| entry.stage = Stage::Done);
+        assert_eq!(monitor.page(0).unwrap().items[0].elapsed, 0);
+    }
+
+    #[test]
     fn finishing_stores_the_final_counts_and_leaves_memory() {
         let monitor = monitor("finish");
         monitor.record(entry(1));
@@ -350,6 +382,37 @@ mod tests {
         monitor.update(1, |entry| entry.stage = Stage::Failed);
         monitor.update(1, |entry| entry.stage = Stage::Done);
         assert_eq!(monitor.store.get(1).unwrap().unwrap().stage, Stage::Failed);
+    }
+
+    #[test]
+    fn history_is_pruned_a_batch_at_a_time_and_counts_requests() {
+        let monitor = monitor("history-batch");
+        monitor
+            .limits
+            .set(Retention { keep: 2, every: 3 }, OFF, BODY);
+        for id in [1, 3, 5, 7] {
+            monitor.record(entry(id));
+            monitor.update(id, |entry| entry.stage = Stage::Done);
+        }
+        assert_eq!(ids(&monitor.page(0).unwrap()), [7, 5, 3, 1]);
+        monitor.record(entry(9));
+        monitor.update(9, |entry| entry.stage = Stage::Done);
+        assert_eq!(ids(&monitor.page(0).unwrap()), [9, 7]);
+    }
+
+    #[test]
+    fn zero_history_records_nothing_new_and_deletes_nothing() {
+        let monitor = monitor("history-off");
+        assert!(monitor.on_request(&ctx(1), &mut outgoing()).is_ok());
+        monitor
+            .limits
+            .set(OFF, Retention { keep: 2, every: 1 }, BODY);
+        assert!(monitor.on_request(&ctx(2), &mut outgoing()).is_ok());
+        monitor.update(1, |entry| entry.stage = Stage::Done);
+        assert_eq!(ids(&monitor.page(0).unwrap()), [1]);
+        assert_eq!(monitor.store.get(1).unwrap().unwrap().stage, Stage::Done);
+        assert!(monitor.exchange(1).unwrap().is_none());
+        assert!(monitor.live().is_empty() && monitor.pending().is_empty());
     }
 
     #[test]
@@ -429,10 +492,27 @@ mod tests {
         let monitor = monitor("captures-midflight");
         monitor.record(entry(1));
         monitor.start_capture(1, &HeaderMap::new(), &[]);
-        monitor.captures.set(0);
+        monitor.limits.set(HISTORY, OFF, BODY);
         monitor.update(1, |entry| entry.apply(Event::Cancelled));
         assert!(monitor.exchange(1).unwrap().is_none());
         assert!(monitor.pending().is_empty());
+    }
+
+    #[test]
+    fn a_running_request_shows_what_was_captured_so_far() {
+        let monitor = monitor("captures-running");
+        monitor.record(entry(1));
+        monitor.start_capture(1, &headers(&[("content-type", "text/plain")]), &[]);
+        monitor.capture(1, Direction::Sent, b"question");
+        let waiting = monitor.exchange(1).unwrap().unwrap();
+        assert_eq!(waiting.request.body, Content::Text("question".to_owned()));
+        assert!(waiting.response.is_none());
+        monitor.answer_capture(1, &headers(&[("server", "upstream")]));
+        monitor.capture(1, Direction::Received, b"ans");
+        let answered = monitor.exchange(1).unwrap().unwrap().response.unwrap();
+        assert_eq!(answered.headers[0].0, "server");
+        assert_eq!(answered.body, Content::Text("ans".to_owned()));
+        assert!(monitor.exchanges.get(1).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -461,30 +541,116 @@ mod tests {
     #[tokio::test]
     async fn nothing_is_captured_when_the_limit_is_zero() {
         let monitor = monitor("captures-off");
-        monitor.captures.set(0);
+        monitor.limits.set(HISTORY, OFF, BODY);
         exchanged(&monitor, 1, b"body").await;
         assert!(monitor.exchange(1).unwrap().is_none());
         assert!(monitor.pending().is_empty());
     }
 
     #[tokio::test]
-    async fn lowering_the_limit_drops_older_contents_at_once() {
-        let monitor = monitor("captures-lower");
-        monitor.captures.set(5);
-        for id in 1..=3 {
+    async fn a_new_body_limit_applies_to_requests_that_start_after_it() {
+        let monitor = monitor("body-limit");
+        let kept = Retention { keep: 2, every: 1 };
+        monitor.record(entry(1));
+        monitor.start_capture(1, &HeaderMap::new(), &[]);
+        monitor.limits.set(HISTORY, kept, 3);
+        monitor.record(entry(2));
+        monitor.start_capture(2, &HeaderMap::new(), &[]);
+        for id in [1, 2] {
+            monitor.capture(id, Direction::Sent, b"request");
+            monitor.store_capture(id);
+        }
+        let body = |id| monitor.exchange(id).unwrap().unwrap().request;
+        assert_eq!(body(1).body, Content::Text("request".to_owned()));
+        assert!(!body(1).truncated);
+        assert_eq!(body(2).body, Content::Text("req".to_owned()));
+        assert!(body(2).truncated);
+    }
+
+    #[tokio::test]
+    async fn a_body_limit_of_zero_stores_headers_without_bodies() {
+        let monitor = monitor("body-off");
+        monitor
+            .limits
+            .set(HISTORY, Retention { keep: 2, every: 1 }, 0);
+        exchanged(&monitor, 1, b"body").await;
+        let exchange = monitor.exchange(1).unwrap().unwrap();
+        assert_eq!(exchange.request.headers.len(), 2);
+        let response = exchange.response.unwrap();
+        assert_eq!(response.body, Content::Empty);
+        assert!(response.truncated);
+    }
+
+    #[tokio::test]
+    async fn contents_are_pruned_a_batch_at_a_time() {
+        let monitor = monitor("captures-batch");
+        monitor
+            .limits
+            .set(HISTORY, Retention { keep: 2, every: 3 }, BODY);
+        for id in 1..=4 {
             exchanged(&monitor, id, b"x").await;
         }
-        monitor.limit_captures(1);
-        assert!(monitor.exchange(2).unwrap().is_none());
-        assert!(monitor.exchange(3).unwrap().is_some());
-        monitor.limit_captures(0);
+        assert_eq!(monitor.exchanges.count().unwrap(), 4);
+        exchanged(&monitor, 5, b"x").await;
+        assert_eq!(monitor.exchanges.count().unwrap(), 2);
         assert!(monitor.exchange(3).unwrap().is_none());
+        assert!(monitor.exchange(4).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_lower_limit_deletes_nothing_until_a_request_finishes() {
+        let monitor = monitor("captures-lower");
+        for id in 1..=2 {
+            exchanged(&monitor, id, b"x").await;
+        }
+        monitor
+            .limits
+            .set(HISTORY, Retention { keep: 1, every: 1 }, BODY);
+        assert_eq!(monitor.exchanges.count().unwrap(), 2);
+        exchanged(&monitor, 3, b"x").await;
+        assert_eq!(monitor.exchanges.count().unwrap(), 1);
+        assert!(monitor.exchange(3).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn turning_contents_off_keeps_what_was_saved() {
+        let monitor = monitor("captures-off-keeps");
+        exchanged(&monitor, 1, b"x").await;
+        monitor.limits.set(HISTORY, OFF, BODY);
+        exchanged(&monitor, 2, b"x").await;
+        assert!(monitor.exchange(1).unwrap().is_some());
+        assert!(monitor.exchange(2).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clearing_contents_keeps_the_history_rows() {
+        let monitor = monitor("captures-clear-only");
+        exchanged(&monitor, 1, b"x").await;
+        monitor.record(entry(2));
+        monitor.start_capture(2, &HeaderMap::new(), &[]);
+        monitor.clear_contents().unwrap();
+        assert!(monitor.exchange(1).unwrap().is_none());
+        assert!(monitor.exchange(2).unwrap().is_none());
+        assert_eq!(ids(&monitor.page(0).unwrap()), [2, 1]);
+    }
+
+    #[tokio::test]
+    async fn the_limit_counts_requests_not_id_numbers() {
+        let monitor = monitor("captures-gaps");
+        for id in [1, 3, 5] {
+            exchanged(&monitor, id, b"body").await;
+        }
+        assert!(monitor.exchange(1).unwrap().is_none());
+        assert!(monitor.exchange(3).unwrap().is_some());
+        assert!(monitor.exchange(5).unwrap().is_some());
     }
 
     #[test]
     fn a_late_finisher_older_than_the_newest_is_not_kept() {
         let monitor = monitor("captures-late");
-        monitor.captures.set(1);
+        monitor
+            .limits
+            .set(HISTORY, Retention { keep: 1, every: 1 }, BODY);
         for id in 1..=3 {
             monitor.record(entry(id));
             monitor.start_capture(id, &HeaderMap::new(), &[]);

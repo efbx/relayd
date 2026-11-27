@@ -6,7 +6,7 @@ use std::{
 };
 
 use relayd_core::{DataDir, Error};
-use relayd_monitor::{CaptureLimit, Monitor};
+use relayd_monitor::Limits;
 use relayd_proxy::{IdleTimeout, Listen};
 use relayd_storage::FileStore;
 use relayd_tunnel::{Tunnel, TunnelConfig};
@@ -19,7 +19,7 @@ pub struct SettingsStore {
     file: FileStore<Settings>,
     tunnel: Tunnel,
     idle_timeout: IdleTimeout,
-    monitor: Monitor,
+    limits: Limits,
 }
 
 #[sylk::resource]
@@ -38,8 +38,13 @@ fn idle_timeout(file: FileStore<Settings>) -> IdleTimeout {
 }
 
 #[sylk::resource]
-fn capture_limit(file: FileStore<Settings>) -> CaptureLimit {
-    CaptureLimit::new(file.read().captures)
+fn limits(file: FileStore<Settings>) -> Limits {
+    let settings = file.read();
+    Limits::new(
+        settings.history_retention(),
+        settings.captures_retention(),
+        settings.body_cap(),
+    )
 }
 
 #[sylk::resource]
@@ -61,11 +66,13 @@ impl SettingsStore {
 
     pub fn save(&self, settings: Settings) -> Result<(), Error> {
         let mode = settings.tunnel.clone();
-        let (idle_timeout, captures) = (settings.idle_timeout, settings.captures);
+        let idle_timeout = settings.idle_timeout;
+        let (history, captures) = (settings.history_retention(), settings.captures_retention());
+        let body = settings.body_cap();
         self.file.set(settings)?;
         self.tunnel.reconfigure(mode);
         self.idle_timeout.set(idle_timeout);
-        self.monitor.limit_captures(captures);
+        self.limits.set(history, captures, body);
         Ok(())
     }
 

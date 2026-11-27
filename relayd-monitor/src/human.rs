@@ -16,6 +16,11 @@ impl Human {
     }
 
     #[must_use]
+    pub fn running(milliseconds: u64) -> FormattedDuration {
+        Self::duration(milliseconds - milliseconds % 1_000)
+    }
+
+    #[must_use]
     pub fn size(bytes: u64) -> ByteSize {
         ByteSize(bytes)
     }
@@ -72,6 +77,12 @@ mod tests {
         assert_eq!(Human::duration(1_250).to_string(), "1s 250ms");
         assert_eq!(Human::duration(65_000).to_string(), "1m 5s");
         assert_eq!(Human::duration(3_725_000).to_string(), "1h 2m 5s");
+    }
+
+    #[test]
+    fn running_times_drop_the_milliseconds() {
+        assert_eq!(Human::running(999).to_string(), "0s");
+        assert_eq!(Human::running(72_437).to_string(), "1m 12s");
     }
 
     #[test]

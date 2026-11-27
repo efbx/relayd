@@ -26,6 +26,13 @@ pub enum Stage {
     Cancelled,
 }
 
+impl Stage {
+    #[must_use]
+    pub fn finished(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+}
+
 #[cfg(feature = "backend")]
 #[derive(Clone, Copy, Debug)]
 pub enum Direction {
@@ -80,7 +87,7 @@ impl Entry {
 
     #[must_use]
     pub fn finished(&self) -> bool {
-        matches!(self.stage, Stage::Done | Stage::Failed | Stage::Cancelled)
+        self.stage.finished()
     }
 
     #[must_use]
@@ -90,7 +97,11 @@ impl Entry {
 
     #[must_use]
     pub fn elapsed_label(&self) -> Label<FormattedDuration> {
-        Label(self.status.map(|_| Human::duration(self.elapsed)))
+        if self.finished() {
+            Label(self.status.map(|_| Human::duration(self.elapsed)))
+        } else {
+            Label(Some(Human::running(self.elapsed)))
+        }
     }
 }
 
@@ -150,6 +161,14 @@ impl Entry {
             sent: 0,
             received: 0,
             expected: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn running(&self) -> Self {
+        Self {
+            elapsed: Self::elapsed().saturating_sub(self.started),
+            ..self.clone()
         }
     }
 
@@ -257,6 +276,21 @@ mod tests {
         let cancelled = after(&[Event::RequestSent, Event::Cancelled]);
         assert!(broken.stage == Stage::Failed && broken.finished());
         assert!(cancelled.stage == Stage::Cancelled && cancelled.finished());
+    }
+
+    #[test]
+    fn running_requests_show_whole_seconds_until_they_finish() {
+        let mut entry = entry();
+        entry.elapsed = 72_437;
+        assert_eq!(entry.elapsed_label().to_string(), "1m 12s");
+        entry.status = Some(200);
+        entry.stage = Stage::Answered;
+        assert_eq!(entry.elapsed_label().to_string(), "1m 12s");
+        entry.stage = Stage::Done;
+        assert_eq!(entry.elapsed_label().to_string(), "1m 12s 437ms");
+        entry.status = None;
+        entry.stage = Stage::Cancelled;
+        assert_eq!(entry.elapsed_label().to_string(), "—");
     }
 
     #[test]

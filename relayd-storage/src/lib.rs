@@ -8,4 +8,4 @@ mod rdbstore;
 pub use filestore::FileStore;
 pub use page::Page;
 #[cfg(feature = "backend")]
-pub use rdbstore::{RdbStore, Record};
+pub use rdbstore::{RdbStore, Record, Retention};

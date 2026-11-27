@@ -1,10 +1,6 @@
 use std::{
     borrow::Cow,
     fmt::{self, Debug, Formatter},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
 };
 
 use axum::http::{
@@ -15,29 +11,11 @@ use relayd_core::Rule;
 
 use crate::{Content, Direction, Exchange, Message};
 
-#[derive(Clone, Debug)]
-pub struct CaptureLimit(Arc<AtomicU64>);
-
-impl CaptureLimit {
-    #[must_use]
-    pub fn new(count: u64) -> Self {
-        Self(Arc::new(AtomicU64::new(count)))
-    }
-
-    pub(crate) fn set(&self, count: u64) {
-        self.0.store(count, Ordering::Relaxed);
-    }
-
-    #[must_use]
-    pub(crate) fn count(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
 #[derive(Debug)]
 pub struct Capture {
     request: Partial,
     response: Option<Partial>,
+    cap: usize,
 }
 
 impl Capture {
@@ -49,10 +27,11 @@ impl Capture {
         HeaderName::from_static("x-api-key"),
     ];
 
-    pub fn new(headers: &HeaderMap, rules: &[Rule]) -> Self {
+    pub fn new(headers: &HeaderMap, rules: &[Rule], cap: usize) -> Self {
         Self {
             request: Partial::new(headers, rules),
             response: None,
+            cap,
         }
     }
 
@@ -62,10 +41,10 @@ impl Capture {
 
     pub fn push(&mut self, direction: Direction, chunk: &[u8]) {
         match direction {
-            Direction::Sent => self.request.push(chunk),
+            Direction::Sent => self.request.push(chunk, self.cap),
             Direction::Received => {
                 if let Some(response) = &mut self.response {
-                    response.push(chunk);
+                    response.push(chunk, self.cap);
                 }
             }
         }
@@ -76,6 +55,14 @@ impl Capture {
             id,
             request: self.request.into_message(),
             response: self.response.map(Partial::into_message),
+        }
+    }
+
+    pub fn snapshot(&self, id: u64) -> Exchange {
+        Exchange {
+            id,
+            request: self.request.snapshot(),
+            response: self.response.as_ref().map(Partial::snapshot),
         }
     }
 
@@ -117,8 +104,8 @@ impl Partial {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) {
-        let kept = chunk.len().min(Exchange::BODY_CAP - self.body.len());
+    fn push(&mut self, chunk: &[u8], cap: usize) {
+        let kept = chunk.len().min(cap.saturating_sub(self.body.len()));
         self.body.extend_from_slice(&chunk[..kept]);
         self.truncated |= kept < chunk.len();
     }
@@ -127,6 +114,14 @@ impl Partial {
         Message {
             headers: self.headers,
             body: Content::from_bytes(self.body, self.truncated),
+            truncated: self.truncated,
+        }
+    }
+
+    fn snapshot(&self) -> Message {
+        Message {
+            headers: self.headers.clone(),
+            body: Content::from_bytes(self.body.clone(), true),
             truncated: self.truncated,
         }
     }
@@ -149,6 +144,8 @@ mod tests {
 
     use super::*;
 
+    const CAP: usize = 64;
+
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
         pairs
             .iter()
@@ -162,7 +159,7 @@ mod tests {
     }
 
     fn captured(chunks: &[&[u8]]) -> Message {
-        let mut capture = Capture::new(&HeaderMap::new(), &[]);
+        let mut capture = Capture::new(&HeaderMap::new(), &[], CAP);
         for chunk in chunks {
             capture.push(Direction::Sent, chunk);
         }
@@ -179,6 +176,7 @@ mod tests {
                 ("cookie", "session=1"),
             ]),
             &[],
+            CAP,
         );
         let request = capture.into_exchange(1).request;
         assert_eq!(
@@ -195,7 +193,11 @@ mod tests {
     #[test]
     fn headers_a_set_rule_injects_are_redacted() {
         let rules = [Rule::try_from("set api-key real".to_owned()).unwrap()];
-        let capture = Capture::new(&headers(&[("api-key", "real"), ("x-trace", "abc")]), &rules);
+        let capture = Capture::new(
+            &headers(&[("api-key", "real"), ("x-trace", "abc")]),
+            &rules,
+            CAP,
+        );
         assert_eq!(
             capture.into_exchange(1).request.headers,
             [
@@ -207,7 +209,7 @@ mod tests {
 
     #[test]
     fn response_headers_are_redacted_too() {
-        let mut capture = Capture::new(&HeaderMap::new(), &[]);
+        let mut capture = Capture::new(&HeaderMap::new(), &[], CAP);
         capture.answer(&headers(&[("set-cookie", "sid=1")]));
         assert_eq!(
             capture.into_exchange(1).response.unwrap().headers,
@@ -230,19 +232,57 @@ mod tests {
 
     #[test]
     fn bodies_stop_at_the_cap_and_a_cut_character_is_dropped() {
-        let filler = vec![b'a'; Exchange::BODY_CAP - 1];
+        let filler = vec![b'a'; CAP - 1];
         let message = captured(&[&filler, "é".as_bytes(), b"rest"]);
         assert!(message.truncated);
         let Content::Text(text) = message.body else {
             panic!("a truncated text body became {:?}", message.body);
         };
-        assert_eq!(text.len(), Exchange::BODY_CAP - 1);
+        assert_eq!(text.len(), CAP - 1);
         assert!(text.bytes().all(|byte| byte == b'a'));
     }
 
     #[test]
+    fn each_capture_stops_at_its_own_cap() {
+        let mut capture = Capture::new(&HeaderMap::new(), &[], 4);
+        capture.push(Direction::Sent, b"hello ");
+        capture.push(Direction::Sent, b"world");
+        capture.answer(&HeaderMap::new());
+        capture.push(Direction::Received, b"ok");
+        let exchange = capture.into_exchange(1);
+        assert_eq!(exchange.request.body, Content::Text("hell".to_owned()));
+        assert!(exchange.request.truncated);
+        let response = exchange.response.unwrap();
+        assert_eq!(response.body, Content::Text("ok".to_owned()));
+        assert!(!response.truncated);
+    }
+
+    #[test]
+    fn a_cap_of_zero_keeps_the_headers_and_no_body() {
+        let mut capture = Capture::new(&headers(&[("x-trace", "abc")]), &[], 0);
+        capture.push(Direction::Sent, b"hello");
+        capture.answer(&headers(&[("content-type", "text/plain")]));
+        capture.push(Direction::Received, b"world");
+        let exchange = capture.into_exchange(1);
+        assert_eq!(exchange.request.headers[0].0, "x-trace");
+        assert_eq!(exchange.request.body, Content::Empty);
+        assert!(exchange.request.truncated);
+        let response = exchange.response.unwrap();
+        assert_eq!(response.headers[0].0, "content-type");
+        assert_eq!(response.body, Content::Empty);
+        assert!(response.truncated);
+    }
+
+    #[test]
+    fn an_empty_body_is_not_marked_as_cut_even_at_zero() {
+        let mut capture = Capture::new(&HeaderMap::new(), &[], 0);
+        capture.push(Direction::Sent, b"");
+        assert!(!capture.into_exchange(1).request.truncated);
+    }
+
+    #[test]
     fn response_chunks_go_to_the_response_once_answered() {
-        let mut capture = Capture::new(&HeaderMap::new(), &[]);
+        let mut capture = Capture::new(&HeaderMap::new(), &[], CAP);
         capture.push(Direction::Received, b"early");
         capture.answer(&headers(&[("content-type", "text/plain")]));
         capture.push(Direction::Received, b"late");
@@ -254,19 +294,30 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_shows_what_arrived_so_far_while_capturing_goes_on() {
+        let mut capture = Capture::new(&headers(&[("authorization", "Bearer real")]), &[], CAP);
+        capture.push(Direction::Sent, b"caf");
+        capture.push(Direction::Sent, &"é".as_bytes()[..1]);
+        let early = capture.snapshot(3);
+        assert_eq!(early.id, 3);
+        assert_eq!(early.request.headers[0].1, "<redacted>");
+        assert_eq!(early.request.body, Content::Text("caf".to_owned()));
+        assert!(early.response.is_none());
+        capture.push(Direction::Sent, &"é".as_bytes()[1..]);
+        capture.answer(&headers(&[("content-type", "text/plain")]));
+        capture.push(Direction::Received, b"ok");
+        let later = capture.snapshot(3);
+        assert_eq!(later.request.body, Content::Text("café".to_owned()));
+        assert_eq!(later.response.unwrap().body, Content::Text("ok".to_owned()));
+        assert_eq!(capture.into_exchange(3).request.body, later.request.body);
+    }
+
+    #[test]
     fn debug_output_shows_sizes_not_contents() {
-        let mut capture = Capture::new(&headers(&[("authorization", "Bearer real")]), &[]);
+        let mut capture = Capture::new(&headers(&[("authorization", "Bearer real")]), &[], CAP);
         capture.push(Direction::Sent, b"secret body");
         let shown = format!("{capture:?}");
         assert!(shown.contains("headers: 1") && shown.contains("body: 11"));
         assert!(!shown.contains("real") && !shown.contains("secret"));
-    }
-
-    #[test]
-    fn the_limit_is_shared_between_clones() {
-        let limit = CaptureLimit::new(10);
-        let other = limit.clone();
-        other.set(3);
-        assert_eq!(limit.count(), 3);
     }
 }

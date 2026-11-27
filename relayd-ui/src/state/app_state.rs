@@ -6,7 +6,7 @@ use dioxus::stores::index::IndexWrite;
 use dioxus_fullstack::ServerFnError;
 use dioxus_sdk_time::sleep;
 use futures_util::StreamExt;
-use relayd_monitor::clear_history;
+use relayd_monitor::{clear_contents, clear_history};
 use relayd_settings::{restart, save_settings, settings};
 use relayd_targets::TargetList;
 use relayd_targets::{save_targets, targets};
@@ -170,6 +170,14 @@ impl AppState {
         });
     }
 
+    pub(crate) fn clear_contents(self) {
+        spawn(async move {
+            if let Err(error) = clear_contents().await {
+                self.fail(error);
+            }
+        });
+    }
+
     pub(crate) fn load_settings(mut self) {
         spawn(async move {
             match settings().await {
@@ -206,8 +214,28 @@ impl AppState {
         self.edit_settings(|draft| draft.idle_timeout = idle_timeout);
     }
 
+    pub(crate) fn set_history(self, history: String) {
+        self.edit_settings(|draft| draft.history = history);
+    }
+
+    pub(crate) fn set_history_prune_every(self, every: String) {
+        self.edit_settings(|draft| draft.history_prune_every = every);
+    }
+
     pub(crate) fn set_captures(self, captures: String) {
         self.edit_settings(|draft| draft.captures = captures);
+    }
+
+    pub(crate) fn set_captures_prune_every(self, every: String) {
+        self.edit_settings(|draft| draft.captures_prune_every = every);
+    }
+
+    pub(crate) fn set_captures_body(self, amount: String) {
+        self.edit_settings(|draft| draft.captures_body = amount);
+    }
+
+    pub(crate) fn set_captures_body_unit(self, unit: String) {
+        self.edit_settings(|draft| draft.captures_body_unit = unit);
     }
 
     pub(crate) fn save_settings(mut self) {

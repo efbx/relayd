@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use dioxus::prelude::*;
+use dioxus_sdk_time::use_interval;
 use relayd_monitor::Entry;
 
 use super::MonitorRow;
@@ -14,9 +17,15 @@ pub(super) fn MonitorView(
     let state = AppState::current();
     let rows = use_store(Vec::<Entry>::new);
     let mut pages = use_signal(|| 1_usize);
-    let open = use_signal(|| None::<u64>);
+    let mut open = use_signal(|| None::<u64>);
+    let mut beat = use_signal(|| 0_u64);
+    use_interval(Duration::from_secs(1), move |()| {
+        if rows.peek().iter().any(|entry| !entry.finished()) {
+            beat += 1;
+        }
+    });
     use_resource(move || async move {
-        _ = version();
+        _ = (version(), beat());
         if let Ok(fresh) = relayd_monitor::entries(number()).await {
             let count = fresh.pages();
             if *pages.peek() != count {
@@ -41,6 +50,14 @@ pub(super) fn MonitorView(
                 span { class: "mono pager", "{number + 1} / {pages}" }
                 Button { ghost: true, disabled: number + 1 >= pages, onclick: move |()| on_page.call(number + 1), "›" }
                 span { class: "spacer" }
+                Button {
+                    ghost: true,
+                    onclick: move |()| {
+                        open.set(None);
+                        state.clear_contents();
+                    },
+                    "clear contents"
+                }
                 Button { ghost: true, onclick: move |()| state.clear_monitor(), "clear" }
             }
             div { class: "table",
@@ -61,7 +78,7 @@ pub(super) fn MonitorView(
                         p { class: "notice", "No requests yet." }
                     }
                     for (index, id) in ids.read().iter().enumerate() {
-                        MonitorRow { key: "{id}", rows, index, id: *id, open, version }
+                        MonitorRow { key: "{id}", rows, index, id: *id, open }
                     }
                 }
             }

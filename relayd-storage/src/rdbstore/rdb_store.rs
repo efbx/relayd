@@ -12,7 +12,7 @@ use redb::{
 };
 use relayd_core::Error;
 
-use super::Record;
+use super::{Record, Retention};
 use crate::Page;
 
 pub struct RdbStore<T> {
@@ -62,21 +62,11 @@ impl<T: Record> RdbStore<T> {
         self.store(record, None).map(drop)
     }
 
-    pub fn put_keeping(&self, record: &T, newest: u64) -> Result<u64, Error> {
-        self.store(record, Some(newest))
+    pub fn put_keeping(&self, record: &T, retention: Retention) -> Result<u64, Error> {
+        self.store(record, Some(retention))
     }
 
-    pub fn keep_newest(&self, newest: u64) -> Result<u64, Error> {
-        let txn = self.database.begin_write().map_err(Self::fail)?;
-        let removed = {
-            let mut table = txn.open_table(self.definition()).map_err(Self::fail)?;
-            Self::drain_to(&mut table, newest)?
-        };
-        txn.commit().map_err(Self::fail)?;
-        Ok(removed)
-    }
-
-    fn store(&self, record: &T, keep: Option<u64>) -> Result<u64, Error> {
+    fn store(&self, record: &T, keep: Option<Retention>) -> Result<u64, Error> {
         let bytes = postcard::to_allocvec(record).map_err(Self::fail)?;
         let txn = self.database.begin_write().map_err(Self::fail)?;
         let removed = {
@@ -85,7 +75,7 @@ impl<T: Record> RdbStore<T> {
                 .insert(record.key(), bytes.as_slice())
                 .map_err(Self::fail)?;
             match keep {
-                Some(newest) => Self::drain_to(&mut table, newest)?,
+                Some(retention) => Self::drain(&mut table, retention)?,
                 None => 0,
             }
         };
@@ -142,33 +132,15 @@ impl<T: Record> RdbStore<T> {
         table.len().map_err(Self::fail)
     }
 
-    pub fn prune(&self, before: u64) -> Result<u64, Error> {
-        let txn = self.database.begin_write().map_err(Self::fail)?;
-        let removed = {
-            let mut table = txn.open_table(self.definition()).map_err(Self::fail)?;
-            Self::drain_below(&mut table, before)?
-        };
-        txn.commit().map_err(Self::fail)?;
-        Ok(removed)
-    }
-
-    fn drain_to(table: &mut Table<'_, u64, &'static [u8]>, newest: u64) -> Result<u64, Error> {
-        let last = table
-            .last()
-            .map_err(Self::fail)?
-            .map(|(key, _)| key.value());
-        match last {
-            Some(last) => Self::drain_below(table, last.saturating_sub(newest.saturating_sub(1))),
-            None => Ok(0),
+    fn drain(
+        table: &mut Table<'_, u64, &'static [u8]>,
+        retention: Retention,
+    ) -> Result<u64, Error> {
+        let excess = retention.excess(table.len().map_err(Self::fail)?);
+        for _ in 0..excess {
+            table.pop_first().map_err(Self::fail)?;
         }
-    }
-
-    fn drain_below(table: &mut Table<'_, u64, &'static [u8]>, before: u64) -> Result<u64, Error> {
-        table
-            .extract_from_if(..before, |_, _| true)
-            .map_err(Self::fail)?
-            .try_fold(0, |removed, row| row.map(|_| removed + 1))
-            .map_err(Self::fail)
+        Ok(excess)
     }
 
     pub fn newest_key(&self) -> Result<Option<u64>, Error> {
@@ -341,27 +313,34 @@ mod tests {
     }
 
     #[test]
-    fn prune_drops_keys_below() {
-        let notes = filled("prune", 5);
-        assert_eq!(notes.prune(3).unwrap(), 2);
-        assert_eq!(ids(&notes.page(0, 10).unwrap()), [5, 4, 3]);
-    }
-
-    #[test]
     fn put_keeping_keeps_only_the_newest_even_for_a_late_record() {
         let notes = filled("put-keeping", 5);
-        assert_eq!(notes.put_keeping(&note(6), 2).unwrap(), 4);
+        let newest_two = Retention { keep: 2, every: 1 };
+        assert_eq!(notes.put_keeping(&note(6), newest_two).unwrap(), 4);
         assert_eq!(ids(&notes.page(0, 10).unwrap()), [6, 5]);
-        assert_eq!(notes.put_keeping(&note(3), 2).unwrap(), 1);
+        assert_eq!(notes.put_keeping(&note(3), newest_two).unwrap(), 1);
         assert_eq!(ids(&notes.page(0, 10).unwrap()), [6, 5]);
     }
 
     #[test]
-    fn keep_newest_drops_everything_older() {
-        let notes = filled("keep-newest", 5);
-        assert_eq!(notes.keep_newest(2).unwrap(), 3);
+    fn put_keeping_waits_for_a_whole_batch_before_dropping() {
+        let notes = filled("put-batch", 3);
+        let retention = Retention { keep: 2, every: 3 };
+        assert_eq!(notes.put_keeping(&note(4), retention).unwrap(), 0);
+        assert_eq!(notes.count().unwrap(), 4);
+        assert_eq!(notes.put_keeping(&note(5), retention).unwrap(), 3);
         assert_eq!(ids(&notes.page(0, 10).unwrap()), [5, 4]);
-        assert_eq!(notes.keep_newest(2).unwrap(), 0);
+    }
+
+    #[test]
+    fn keeping_counts_records_not_key_numbers() {
+        let notes = RdbStore::<Note>::open(fresh("gaps")).unwrap();
+        for id in [1, 3, 5] {
+            notes.put(&note(id)).unwrap();
+        }
+        let newest_three = Retention { keep: 3, every: 1 };
+        assert_eq!(notes.put_keeping(&note(7), newest_three).unwrap(), 1);
+        assert_eq!(ids(&notes.page(0, 10).unwrap()), [7, 5, 3]);
     }
 
     #[test]
